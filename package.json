@@ -1,0 +1,16 @@
+{
+  "name": "team-9470-attendance",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node test/attendance.test.js && node test/onboarding.test.js && node test/syntax.test.js && sh -n scripts/create-google-project.sh",
+    "preview": "node test/build-preview.js",
+    "preflight": "npm test && node test/preflight.js",
+    "google:login": "clasp login",
+    "google:status": "clasp show-authorized-user",
+    "google:create": "sh scripts/create-google-project.sh"
+  },
+  "devDependencies": {
+    "@google/clasp": "3.3.0"
+  }
+}

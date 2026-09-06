@@ -1,0 +1,407 @@
+<script>
+  (() => {
+    const app = document.getElementById('app');
+    const storageKey = 'team9470-attendance-kiosk';
+    let credential = localStorage.getItem(storageKey) || '';
+    let students = [];
+    let selected = null;
+    let pin = '';
+    let firstPin = '';
+    let pinFlow = 'checkin';
+    let pinSetup = { enabled: false, until: '', message: '' };
+    let idleTimer = null;
+    let slowRequestTimer = null;
+    let requestPending = false;
+    let waitingForConnection = false;
+
+    const readTimeoutMs = 15000;
+
+    const call = (method, ...args) => new Promise((resolve, reject) => {
+      google.script.run.withSuccessHandler(resolve).withFailureHandler((error) => {
+        reject(new Error(error && error.message ? error.message : 'Unable to connect.'));
+      })[method](...args);
+    });
+
+    const readCall = (method, ...args) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const error = new Error('Cannot reach attendance. Check Wi-Fi and try again.');
+        error.code = 'CONNECTION_TIMEOUT';
+        reject(error);
+      }, readTimeoutMs);
+      call(method, ...args).then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      }, (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+
+    const escapeText = (value) => String(value || '').replace(/[&<>'"]/g, (character) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+    })[character]);
+
+    const setIdleTimer = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(renderRoster, BOOTSTRAP.idleResetSeconds * 1000);
+    };
+
+    const renderShell = (content) => {
+      app.innerHTML = content;
+    };
+
+    function setRequestMessage(message) {
+      const notice = document.getElementById('request-notice');
+      if (notice) notice.textContent = message;
+    }
+
+    function beginRequest(message = 'Connecting…') {
+      clearTimeout(slowRequestTimer);
+      requestPending = true;
+      app.classList.add('loading');
+      let notice = document.getElementById('request-notice');
+      if (!notice) {
+        notice = document.createElement('div');
+        notice.id = 'request-notice';
+        notice.className = 'request-notice';
+        notice.setAttribute('role', 'status');
+        document.body.appendChild(notice);
+      }
+      setRequestMessage(navigator.onLine === false
+        ? 'No internet. Reconnect Wi-Fi; this request will continue automatically.'
+        : message);
+      slowRequestTimer = setTimeout(() => {
+        setRequestMessage('Still waiting for the network. Check Wi-Fi; do not submit again.');
+      }, 8000);
+    }
+
+    function endRequest() {
+      clearTimeout(slowRequestTimer);
+      requestPending = false;
+      app.classList.remove('loading');
+      const notice = document.getElementById('request-notice');
+      if (notice) notice.remove();
+    }
+
+    function renderConnectionError(message) {
+      waitingForConnection = true;
+      renderShell(`
+        <section class="panel center">
+          <h1>Attendance</h1>
+          <p class="status">${escapeText(message)}</p>
+          <button id="retry-connection" class="button">Retry</button>
+        </section>
+      `);
+      document.getElementById('retry-connection').addEventListener('click', start);
+    }
+
+    async function start() {
+      waitingForConnection = false;
+      if (BOOTSTRAP.mode === 'pin') return renderPinLink();
+      if (BOOTSTRAP.mode === 'activate') return renderActivation();
+      if (!credential) return renderUnauthorized('Kiosk not activated.');
+      renderShell('<div class="panel center"><p class="muted">Loading…</p></div>');
+      try {
+        await loadKioskState();
+        renderRoster();
+      } catch (error) {
+        if (/revoked|authorized kiosk/i.test(error.message)) localStorage.removeItem(storageKey);
+        if (error.code === 'CONNECTION_TIMEOUT' || navigator.onLine === false) {
+          renderConnectionError(error.message);
+        } else {
+          renderUnauthorized(error.message);
+        }
+      }
+    }
+
+    async function loadKioskState() {
+      const results = await Promise.all([
+        readCall('listStudents', credential),
+        readCall('getPinSetupStatus', credential)
+      ]);
+      students = results[0];
+      pinSetup = results[1];
+    }
+
+    function renderUnauthorized(message) {
+      renderShell(`<section class="panel center"><h1>Attendance</h1><p class="status">${escapeText(message)}</p><p class="muted">A leader must activate this device.</p></section>`);
+    }
+
+    function renderRoster() {
+      clearTimeout(idleTimer);
+      selected = null;
+      pin = '';
+      firstPin = '';
+      pinFlow = 'checkin';
+      renderShell(`
+        <header class="topbar"><h1>Attendance</h1><span class="team-mark">9470</span></header>
+        ${pinSetup.enabled ? `<div class="setup-notice"><strong>PIN setup is open.</strong><span>Students without a PIN can create one and check in. Leader supervision required.</span></div>` : ''}
+        <input id="search" class="search" type="search" placeholder="Search students…" autocomplete="off" aria-label="Search students">
+        <section id="student-grid" class="student-grid"></section>
+      `);
+      const search = document.getElementById('search');
+      search.addEventListener('input', () => renderStudentButtons(search.value));
+      renderStudentButtons('');
+    }
+
+    function renderStudentButtons(query) {
+      const normalized = String(query || '').trim().toLowerCase();
+      const matches = students
+        .filter((student) => student.name.toLowerCase().includes(normalized))
+        .sort((left, right) => {
+          if (left.checkedInToday !== right.checkedInToday) return left.checkedInToday ? 1 : -1;
+          return left.name.localeCompare(right.name);
+        });
+      const grid = document.getElementById('student-grid');
+      if (!matches.length) {
+        grid.innerHTML = '<p class="empty">No students found.</p>';
+        return;
+      }
+      grid.innerHTML = matches.map((student) => `
+        <button class="student-button ${student.checkedInToday ? 'checked-in' : ''}" data-id="${escapeText(student.id)}" ${student.checkedInToday ? 'disabled' : ''}>
+          <span>${escapeText(student.name)}</span>
+          ${student.checkedInToday ? '<span class="checked-label">✓ Checked in</span>' : ''}
+          ${!student.checkedInToday && !student.pinSet && pinSetup.enabled ? '<span class="setup-label">Set PIN</span>' : ''}
+        </button>
+      `).join('');
+      grid.querySelectorAll('button').forEach((button) => button.addEventListener('click', () => {
+        selected = students.find((student) => student.id === button.dataset.id);
+        pin = '';
+        firstPin = '';
+        if (!selected.pinSet && !pinSetup.enabled) return renderPinUnavailable();
+        pinFlow = selected.pinSet ? 'checkin' : 'setup';
+        renderPinEntry();
+      }));
+    }
+
+    function renderPinUnavailable() {
+      setIdleTimer();
+      renderShell(`
+        <section class="panel center">
+          <h2>${escapeText(selected.name)}</h2>
+          <p class="muted">This student does not have a PIN yet.</p>
+          <p class="status">Ask a leader to start supervised PIN setup.</p>
+          <button class="text-button" data-action="back">Back</button>
+        </section>
+      `);
+      app.querySelector('[data-action="back"]').addEventListener('click', renderRoster);
+    }
+
+    function renderPinEntry(message = '') {
+      setIdleTimer();
+      const setupFlow = pinFlow !== 'checkin';
+      const instruction = pinFlow === 'setup'
+        ? 'Create a four-digit PIN'
+        : pinFlow === 'confirm'
+          ? 'Enter the same PIN again'
+          : 'Enter your four-digit PIN';
+      renderShell(`
+        <section class="panel">
+          <h2>${escapeText(selected.name)}</h2>
+          <p class="pin-instruction">${instruction}</p>
+          <div class="pin-dots" aria-label="${pin.length} of 4 digits entered">
+            ${[0, 1, 2, 3].map((index) => `<span class="pin-dot ${index < pin.length ? 'filled' : ''}"></span>`).join('')}
+          </div>
+          <div class="keypad">
+            ${[1,2,3,4,5,6,7,8,9].map((number) => `<button class="key" data-digit="${number}">${number}</button>`).join('')}
+            <button class="key" data-action="delete" aria-label="Delete">⌫</button>
+            <button class="key" data-digit="0">0</button>
+            <button class="key submit" data-action="submit" ${pin.length !== 4 ? 'disabled' : ''} aria-label="Check in">✓</button>
+          </div>
+          <p class="status">${escapeText(message)}</p>
+          <div class="actions">
+            <button class="text-button" data-action="back">Back</button>
+            ${setupFlow ? '' : '<button class="text-button" data-action="forgot">Forgot PIN?</button>'}
+          </div>
+        </section>
+      `);
+      app.querySelectorAll('[data-digit]').forEach((button) => button.addEventListener('click', () => addDigit(button.dataset.digit)));
+      app.querySelector('[data-action="delete"]').addEventListener('click', deleteDigit);
+      app.querySelector('[data-action="submit"]').addEventListener('click', submit);
+      app.querySelector('[data-action="back"]').addEventListener('click', renderRoster);
+      const forgot = app.querySelector('[data-action="forgot"]');
+      if (forgot) forgot.addEventListener('click', requestReset);
+    }
+
+    function addDigit(digit) {
+      if (pin.length >= 4) return;
+      pin += digit;
+      renderPinEntry();
+    }
+
+    function deleteDigit() {
+      pin = pin.slice(0, -1);
+      renderPinEntry();
+    }
+
+    async function submit() {
+      if (pin.length !== 4) return;
+      if (pinFlow === 'setup') {
+        firstPin = pin;
+        pin = '';
+        pinFlow = 'confirm';
+        renderPinEntry();
+        return;
+      }
+      if (pinFlow === 'confirm' && firstPin !== pin) {
+        pin = '';
+        firstPin = '';
+        pinFlow = 'setup';
+        renderPinEntry('PINs did not match. Start again.');
+        return;
+      }
+      clearTimeout(idleTimer);
+      beginRequest('Saving…');
+      try {
+        const result = pinFlow === 'confirm'
+          ? await call('setupPinAndCheckIn', selected.id, firstPin, pin, credential)
+          : await call('submitCheckIn', selected.id, pin, credential);
+        endRequest();
+        if (!result.ok) {
+          pin = '';
+          if (result.code === 'PIN_ALREADY_SET') {
+            selected.pinSet = true;
+            firstPin = '';
+            pinFlow = 'checkin';
+          } else if (pinFlow === 'confirm') {
+            firstPin = '';
+            pinFlow = result.code === 'SETUP_CLOSED' ? 'checkin' : 'setup';
+            if (result.code === 'SETUP_CLOSED') {
+              pinSetup = { enabled: false, until: '', message: '' };
+              return renderPinUnavailable();
+            }
+          }
+          renderPinEntry(result.message);
+          return;
+        }
+        renderSuccess(result);
+      } catch (error) {
+        endRequest();
+        pin = '';
+        renderPinEntry(error.message);
+      }
+    }
+
+    function renderSuccess(result) {
+      clearTimeout(idleTimer);
+      if (selected) {
+        selected.checkedInToday = true;
+        if (result.pinCreated) selected.pinSet = true;
+      }
+      renderShell(`
+        <section class="success">
+          <div class="success-icon">✓</div>
+          <h1>${escapeText(result.name)}</h1>
+          <p>${escapeText(result.code === 'ALREADY' ? result.message : `${result.message} ${result.time}`)}</p>
+        </section>
+      `);
+      setTimeout(renderRoster, BOOTSTRAP.successResetSeconds * 1000);
+    }
+
+    async function requestReset() {
+      clearTimeout(idleTimer);
+      beginRequest('Sending reset link…');
+      try {
+        const result = await call('requestPinReset', selected.id, credential);
+        endRequest();
+        renderPinEntry(result.message);
+      } catch (error) {
+        endRequest();
+        renderPinEntry(error.message);
+      }
+    }
+
+    function renderActivation() {
+      renderShell(`
+        <section class="panel center">
+          <h1>Activate kiosk</h1>
+          <p id="activation-status" class="status"></p>
+          <button id="activate" class="button">Activate</button>
+        </section>
+      `);
+      document.getElementById('activate').addEventListener('click', async (event) => {
+        event.currentTarget.disabled = true;
+        try {
+          const result = await call('activateKiosk', BOOTSTRAP.token);
+          if (!result.ok) throw new Error(result.message);
+          localStorage.setItem(storageKey, result.credential);
+          credential = result.credential;
+          document.getElementById('activation-status').textContent = 'Kiosk activated.';
+          await loadKioskState();
+          setTimeout(renderRoster, 700);
+        } catch (error) {
+          event.currentTarget.disabled = false;
+          document.getElementById('activation-status').textContent = error.message;
+        }
+      });
+    }
+
+    async function renderPinLink() {
+      renderShell('<section class="panel center"><p class="muted">Loading…</p></section>');
+      const validation = await readCall('validatePinLink', BOOTSTRAP.token);
+      if (!validation.ok) {
+        renderShell(`<section class="panel center"><h1>PIN setup</h1><p class="status">${escapeText(validation.message)}</p></section>`);
+        return;
+      }
+      renderShell(`
+        <section class="panel">
+          <h2>${escapeText(validation.name)}</h2>
+          <label class="field-label" for="pin">Four-digit PIN</label>
+          <input id="pin" class="field" type="password" inputmode="numeric" maxlength="4" autocomplete="new-password">
+          <label class="field-label" for="confirm">Confirm PIN</label>
+          <input id="confirm" class="field" type="password" inputmode="numeric" maxlength="4" autocomplete="new-password">
+          <p id="pin-status" class="status"></p>
+          <button id="save-pin" class="button">Save PIN</button>
+        </section>
+      `);
+      const pinInput = document.getElementById('pin');
+      const confirmation = document.getElementById('confirm');
+      [pinInput, confirmation].forEach((input) => input.addEventListener('input', () => {
+        input.value = input.value.replace(/\D/g, '').slice(0, 4);
+      }));
+      document.getElementById('save-pin').addEventListener('click', async (event) => {
+        event.currentTarget.disabled = true;
+        beginRequest('Saving PIN…');
+        try {
+          const result = await call('setPinWithToken', BOOTSTRAP.token, pinInput.value, confirmation.value);
+          endRequest();
+          if (!result.ok) {
+            event.currentTarget.disabled = false;
+            document.getElementById('pin-status').textContent = result.message;
+            return;
+          }
+          renderShell('<section class="success"><div class="success-icon">✓</div><h1>PIN saved</h1></section>');
+        } catch (error) {
+          endRequest();
+          event.currentTarget.disabled = false;
+          document.getElementById('pin-status').textContent = error.message;
+        }
+      });
+      pinInput.focus();
+    }
+
+    document.addEventListener('keydown', (event) => {
+      if (!selected || BOOTSTRAP.mode !== 'kiosk') return;
+      if (/^\d$/.test(event.key)) addDigit(event.key);
+      if (event.key === 'Backspace') deleteDigit();
+      if (event.key === 'Enter') submit();
+      if (event.key === 'Escape') renderRoster();
+    });
+
+    window.addEventListener('offline', () => {
+      if (requestPending) {
+        setRequestMessage('No internet. Reconnect Wi-Fi; this request will continue automatically.');
+      }
+    });
+
+    window.addEventListener('online', () => {
+      if (requestPending) {
+        setRequestMessage('Connection restored. Finishing…');
+      } else if (waitingForConnection) {
+        start();
+      }
+    });
+
+    start().catch((error) => renderUnauthorized(error.message));
+  })();
+</script>
